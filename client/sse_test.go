@@ -5,10 +5,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/mark3labs/mcp-go/client/transport"
+	"github.com/abhimoondra/mcp-go/client/transport"
 
-	"github.com/mark3labs/mcp-go/mcp"
-	"github.com/mark3labs/mcp-go/server"
+	"github.com/abhimoondra/mcp-go/mcp"
+	"github.com/abhimoondra/mcp-go/server"
 )
 
 func TestSSEMCPClient(t *testing.T) {
