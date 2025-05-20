@@ -224,6 +224,10 @@ func (c *StreamableHTTP) SendRequest(
 		return &response, nil
 
 	case "text/event-stream":
+		var response JSONRPCResponse
+		if err := json.NewDecoder(resp.Body).Decode(&response); err != nil {
+			fmt.Printf("failed to decode response: %v", err)
+		}
 		// Server is using SSE for streaming responses
 		return c.handleSSEResponse(ctx, resp.Body)
 
