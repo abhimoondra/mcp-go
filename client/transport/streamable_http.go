@@ -26,6 +26,12 @@ func WithHTTPHeaders(headers map[string]string) StreamableHTTPCOption {
 	}
 }
 
+func WithStreamableHTTPClient(httpClient *http.Client) StreamableHTTPCOption {
+	return func(sc *StreamableHTTP) {
+		sc.httpClient = httpClient
+	}
+}
+
 // WithHTTPTimeout sets the timeout for a HTTP request and stream.
 func WithHTTPTimeout(timeout time.Duration) StreamableHTTPCOption {
 	return func(sc *StreamableHTTP) {
