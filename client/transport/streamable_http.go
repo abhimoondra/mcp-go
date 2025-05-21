@@ -204,6 +204,7 @@ func (c *StreamableHTTP) SendRequest(
 		if sessionID := resp.Header.Get(headerKeySessionID); sessionID != "" {
 			c.sessionID.Store(sessionID)
 		}
+		resp.Header.Set("Content-Type", "text/event-stream")
 	}
 
 	// Handle different response types
