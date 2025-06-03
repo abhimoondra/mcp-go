@@ -100,7 +100,8 @@ func (c *Client) sendRequest(
 		return nil, fmt.Errorf("client not initialized")
 	}
 
-	id := c.requestID.Add(1)
+	id := c.requestID.Load()
+	c.requestID.Add(1)
 
 	request := transport.JSONRPCRequest{
 		JSONRPC: mcp.JSONRPC_VERSION,

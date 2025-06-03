@@ -11,6 +11,7 @@ import (
 	"mime"
 	"net/http"
 	"net/url"
+	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -80,7 +81,12 @@ type StreamableHTTP struct {
 	notificationHandler func(mcp.JSONRPCNotification)
 	notifyMu            sync.RWMutex
 
-	closed chan struct{}
+	mu sync.RWMutex
+
+	responses map[string]chan *JSONRPCResponse
+
+	closed          chan struct{}
+	cancelGetStream context.CancelFunc
 
 	// OAuth support
 	oauthHandler *OAuthHandler
@@ -99,6 +105,7 @@ func NewStreamableHTTP(serverURL string, options ...StreamableHTTPCOption) (*Str
 		httpClient: &http.Client{},
 		headers:    make(map[string]string),
 		closed:     make(chan struct{}),
+		responses:  make(map[string]chan *JSONRPCResponse),
 	}
 	smc.sessionID.Store("") // set initial value to simplify later usage
 
@@ -119,6 +126,88 @@ func NewStreamableHTTP(serverURL string, options ...StreamableHTTPCOption) (*Str
 // Start initiates the HTTP connection to the server.
 func (c *StreamableHTTP) Start(ctx context.Context) error {
 	// For Streamable HTTP, we don't need to establish a persistent connection
+
+	return nil
+}
+
+func (c *StreamableHTTP) initiateGetStream(ctx context.Context) error {
+	ctx, cancel := context.WithCancel(ctx)
+	c.cancelGetStream = cancel
+
+	req, err := http.NewRequestWithContext(ctx, "GET", c.serverURL.String(), nil)
+
+	if err != nil {
+		return fmt.Errorf("failed to create request: %w", err)
+	}
+
+	req.Header.Set("Accept", "text/event-stream")
+	req.Header.Set("Cache-Control", "no-cache")
+	req.Header.Set("Connection", "keep-alive")
+	req.Header.Set(headerKeySessionID, c.sessionID.Load().(string))
+
+	// set custom http headers
+	for k, v := range c.headers {
+		req.Header.Set(k, v)
+	}
+	if c.headerFunc != nil {
+		for k, v := range c.headerFunc(ctx) {
+			req.Header.Set(k, v)
+		}
+	}
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("failed to connect to SSE stream: %w", err)
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		resp.Body.Close()
+		if resp.StatusCode == http.StatusMethodNotAllowed {
+			// This is a special case where the server does not support SSE streaming
+			return nil
+		}
+		body, _ := io.ReadAll(resp.Body)
+		var errResponse JSONRPCResponse
+		if err := json.Unmarshal(body, &errResponse); err == nil {
+			fmt.Println(errResponse)
+		}
+		return fmt.Errorf("unexpected status code: %d", resp.StatusCode)
+	}
+
+	go c.readSSE(ctx, resp.Body, func(event, data string) {
+
+		// (unsupported: batching)
+
+		fmt.Printf("executing from get")
+
+		var message JSONRPCResponse
+		if err := json.Unmarshal([]byte(data), &message); err != nil {
+			fmt.Printf("failed to unmarshal message: %v\n", err)
+			return
+		}
+
+		// Handle notification
+		if message.ID.IsNil() {
+			var notification mcp.JSONRPCNotification
+			if err := json.Unmarshal([]byte(data), &notification); err != nil {
+				fmt.Printf("failed to unmarshal notification: %v\n", err)
+				return
+			}
+			c.notifyMu.RLock()
+			if c.notificationHandler != nil {
+				c.notificationHandler(notification)
+			}
+			c.notifyMu.RUnlock()
+			return
+		}
+
+		c.mu.RLock()
+		ch := c.responses[message.ID.String()]
+		c.mu.RUnlock()
+
+		ch <- &message
+	})
+
 	return nil
 }
 
@@ -132,10 +221,19 @@ func (c *StreamableHTTP) Close() error {
 	// Cancel all in-flight requests
 	close(c.closed)
 
+	if c.cancelGetStream != nil {
+		c.cancelGetStream()
+	}
+
 	sessionId := c.sessionID.Load().(string)
 	if sessionId != "" {
 		c.sessionID.Store("")
-
+		c.mu.Lock()
+		for _, ch := range c.responses {
+			close(ch)
+		}
+		c.responses = make(map[string]chan *JSONRPCResponse)
+		c.mu.Unlock()
 		// notify server session closed
 		go func() {
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -221,6 +319,8 @@ func (c *StreamableHTTP) SendRequest(
 		req.Header.Set(k, v)
 	}
 
+	c.responses[request.ID.String()] = make(chan *JSONRPCResponse, 1)
+
 	// Add OAuth authorization if configured
 	if c.oauthHandler != nil {
 		authHeader, err := c.oauthHandler.GetAuthorizationHeader(ctx)
@@ -279,15 +379,20 @@ func (c *StreamableHTTP) SendRequest(
 		if sessionID := resp.Header.Get(headerKeySessionID); sessionID != "" {
 			c.sessionID.Store(sessionID)
 		}
+		err = c.initiateGetStream(context.Background())
+		if err != nil {
+			fmt.Printf("failed to initiate get stream request\n: %v", err)
+		}
 	}
 
 	// Handle different response types
 	mediaType, _, _ := mime.ParseMediaType(resp.Header.Get("Content-Type"))
+	tee := io.TeeReader(resp.Body, os.Stderr)
 	switch mediaType {
 	case "application/json":
 		// Single response
 		var response JSONRPCResponse
-		if err := json.NewDecoder(resp.Body).Decode(&response); err != nil {
+		if err := json.NewDecoder(io.NopCloser(tee)).Decode(&response); err != nil {
 			return nil, fmt.Errorf("failed to decode response: %w", err)
 		}
 
@@ -299,12 +404,11 @@ func (c *StreamableHTTP) SendRequest(
 		return &response, nil
 
 	case "text/event-stream":
-		var response JSONRPCResponse
-		if err := json.NewDecoder(resp.Body).Decode(&response); err != nil {
-			fmt.Printf("failed to decode response: %v", err)
-		}
 		// Server is using SSE for streaming responses
-		return c.handleSSEResponse(ctx, resp.Body)
+
+		// Create a TeeReader to dump the response body to Stderr for debugging
+		// Use io.NopCloser to wrap the TeeReader so it satisfies io.ReadCloser
+		return c.handleSSEResponse(ctx, io.NopCloser(tee), request.ID.String())
 
 	default:
 		return nil, fmt.Errorf("unexpected content type: %s", resp.Header.Get("Content-Type"))
@@ -313,18 +417,20 @@ func (c *StreamableHTTP) SendRequest(
 
 // handleSSEResponse processes an SSE stream for a specific request.
 // It returns the final result for the request once received, or an error.
-func (c *StreamableHTTP) handleSSEResponse(ctx context.Context, reader io.ReadCloser) (*JSONRPCResponse, error) {
-
-	// Create a channel for this specific request
-	responseChan := make(chan *JSONRPCResponse, 1)
+func (c *StreamableHTTP) handleSSEResponse(ctx context.Context, reader io.ReadCloser, messageId string) (*JSONRPCResponse, error) {
 
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
+	deleteResponseChan := func() {
+		c.mu.Lock()
+		delete(c.responses, messageId)
+		c.mu.Unlock()
+	}
+
 	// Start a goroutine to process the SSE stream
 	go func() {
 		// only close responseChan after readingSSE()
-		defer close(responseChan)
 
 		c.readSSE(ctx, reader, func(event, data string) {
 
@@ -351,16 +457,21 @@ func (c *StreamableHTTP) handleSSEResponse(ctx context.Context, reader io.ReadCl
 				return
 			}
 
-			responseChan <- &message
+			c.mu.RLock()
+			ch := c.responses[message.ID.String()]
+			c.mu.RUnlock()
+
+			ch <- &message
 		})
 	}()
 
 	// Wait for the response or context cancellation
 	select {
-	case response := <-responseChan:
+	case response := <-c.responses[messageId]:
 		if response == nil {
 			return nil, fmt.Errorf("unexpected nil response")
 		}
+		deleteResponseChan()
 		return response, nil
 	case <-ctx.Done():
 		return nil, ctx.Err()
@@ -374,7 +485,6 @@ func (c *StreamableHTTP) readSSE(ctx context.Context, reader io.ReadCloser, hand
 
 	br := bufio.NewReader(reader)
 	var event, data string
-
 	for {
 		select {
 		case <-ctx.Done():
