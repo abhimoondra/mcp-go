@@ -182,6 +182,10 @@ func (c *StreamableHTTP) SendRequest(
 
 	// Send request
 	resp, err := c.httpClient.Do(req)
+	if request.Method == initializeMethod {
+		resp.Header.Set("Content-Type", "text/event-stream")
+	}
+
 	if err != nil {
 		return nil, fmt.Errorf("failed to send request: %w", err)
 	}
